@@ -69,7 +69,7 @@ class Queries(object):
         if params is None:
             params = dict()
 
-        max_retries = 20  # Increased retries for slow endpoints
+        max_retries = 5  # Increased retries for slow endpoints
         base_delay = 5    # You can increase this further if needed
         headers = {
             "Authorization": f"token {self.access_token}",
