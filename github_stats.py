@@ -66,11 +66,18 @@ class Queries(object):
         return dict()
 
     async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
-        max_retries = 10
-        base_delay = 2
+        if params is None:
+            params = dict()
+
+        max_retries = 20  # Increased retries for slow endpoints
+        base_delay = 5    # You can increase this further if needed
         headers = {
             "Authorization": f"token {self.access_token}",
-            }
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if path.startswith("/"):
+            path = path[1:]
         for attempt in range(max_retries):
             try:
                 async with self.semaphore:
@@ -80,18 +87,83 @@ class Queries(object):
                         params=tuple(params.items()),
                     )
                 if r_async.status == 202:
-                    delay = base_delay * math.pow(2, attempt)  # exponential backoff
-                    print(f"A path returned 202. Retrying in {delay} seconds...")
+                    delay = base_delay * (2 ** attempt)
+                    print(f"!A path ({path}) with params: {params} returned 202. Retrying in {delay} seconds (attempt {attempt+1}/{max_retries})...")
                     await asyncio.sleep(delay)
                     continue
+                if r_async.status == 204:
+                    print(f"No content from {path}")
+                    # No Content
+                    return dict()
+                print(f"I got it! from path {path}")
                 result = await r_async.json()
                 if result is not None:
                     return result
             except Exception as e:
                 print(f"aiohttp failed for rest query: {e}")
-                # Optional: fallback or break
-                break
-        print("There were too many 202s or repeated failures. Data for this repository will be incomplete.")
+                # Fall back on non-async requests
+                try:
+                    r_requests = requests.get(
+                        f"https://api.github.com/{path}",
+                        headers=headers,
+                        params=tuple(params.items()),  # params is always a dict now
+                    )
+                    if r_requests.status_code == 202:
+                        delay = base_delay * (2 ** attempt)
+                        print(f"A path ({path}) returned 202. Retrying in {delay} seconds (attempt {attempt+1}/{max_retries})...")
+                        await asyncio.sleep(delay)
+                        continue
+                    elif r_requests.status_code == 200:
+                        print(f"success downloading data from path {path}")
+                        return r_requests.json()
+                    elif r_requests.status_code == 204:
+                        print(f"204 from path {path}")
+                        return dict()
+                except Exception as e2:
+                    print(f"requests failed for rest query: {e2}")
+                    break
+
+        # After all retries, wait a final long time and try once more
+        print(f"Too many 202s or repeated failures for path: {path}. Waiting 60 seconds and trying one last time...")
+        await asyncio.sleep(60)
+        try:
+            async with self.semaphore:
+                r_async = await self.session.get(
+                    f"https://api.github.com/{path}",
+                    headers=headers,
+                    params=tuple(params.items()),
+                )
+            if r_async.status == 202:
+                print(f"Final attempt for path ({path}) still returned 202. Giving up.")
+                return dict()
+            if r_async.status == 204:
+                print(f"Final attempt for path ({path}) still returned 204.")
+                return dict()
+            
+            print(f"I got it! with code {r_async.status}")
+            result = await r_async.json()
+            if result is not None:
+                return result
+        except Exception as e:
+            print(f"aiohttp final attempt failed for rest query: {e}")
+        try:
+            r_requests = requests.get(
+                f"https://api.github.com/{path}",
+                headers=headers,
+                params=tuple(params.items()),
+            )
+            if r_requests.status_code == 202:
+                print(f"Final attempt for path ({path}) still returned 202. Giving up.")
+                return dict()
+            elif r_requests.status_code == 200:
+                print(f"Final attempt for path {path} with success")
+                return r_requests.json()
+            elif r_requests.status_code == 204:
+                print(f"Final attempt for path {path} with 204")
+                return dict()
+        except Exception as e2:
+            print(f"requests final attempt failed for rest query: {e2}")
+        print(f"There were too many 202s or repeated failures for path: {path}. Data for this repository will be incomplete.")
         return dict()
 
     @staticmethod
@@ -456,13 +528,27 @@ Languages:
     async def lines_changed(self) -> Tuple[int, int]:
         """
         :return: count of total lines added, removed, or modified by the user
+        
+        Note: GitHub's /stats/contributors endpoint returns 0 values for all 
+        addition and deletion counts in repositories with 10,000 or more commits.
+        This is a limitation of the GitHub API as of 2022-11-28.
         """
         if self._lines_changed is not None:
             return self._lines_changed
         additions = 0
         deletions = 0
+        repos_processed = 0
+        repos_with_data = 0
+        
         for repo in await self.repos:
+            repos_processed += 1
             r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
+            
+            # Handle empty response (common for large repos or when stats are being computed)
+            if not r or not isinstance(r, list):
+                continue
+                
+            found_user_data = False
             for author_obj in r:
                 # Handle malformed response from the API by skipping this repo
                 if not isinstance(author_obj, dict) or not isinstance(
@@ -473,9 +559,32 @@ Languages:
                 if author != self.username:
                     continue
 
+                found_user_data = True
+                repo_additions = 0
+                repo_deletions = 0
+                
                 for week in author_obj.get("weeks", []):
-                    additions += week.get("a", 0)
-                    deletions += week.get("d", 0)
+                    week_additions = week.get("a", 0)
+                    week_deletions = week.get("d", 0)
+                    repo_additions += week_additions
+                    repo_deletions += week_deletions
+
+                # Only count repos that have non-zero data (to detect the 10k+ commit limitation)
+                if repo_additions > 0 or repo_deletions > 0:
+                    repos_with_data += 1
+                    
+                additions += repo_additions
+                deletions += repo_deletions
+                break  # Found the user, no need to continue with other authors
+        
+        # Log a warning if we suspect we hit the 10k+ commit limitation
+        if repos_processed > 0 and repos_with_data == 0:
+            print(f"⚠️  Warning: No line change data found for any repositories.")
+            print(f"   This may be due to GitHub's API limitation where repositories")
+            print(f"   with 10,000+ commits return 0 values for additions/deletions.")
+        elif repos_with_data < repos_processed * 0.5:  # Less than 50% of repos have data
+            print(f"⚠️  Warning: Only {repos_with_data}/{repos_processed} repositories returned line change data.")
+            print(f"   Some repositories may have 10,000+ commits (GitHub API limitation).")
 
         self._lines_changed = (additions, deletions)
         return self._lines_changed
