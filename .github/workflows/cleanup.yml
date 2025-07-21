@@ -1,0 +1,22 @@
+name: Cleanup Merged Branches
+
+on:
+  pull_request:
+    types:
+      - closed
+
+jobs:
+  delete-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Delete Branch if Merged
+        if: github.event.pull_request.merged == true
+        run: |
+          branch="${{ github.event.pull_request.head.ref }}"
+          echo "Deleting branch $branch"
+          git push origin --delete "$branch"
